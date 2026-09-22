@@ -40,6 +40,7 @@ func NewServer(m *job.Manager) *gin.Engine {
 		v1.GET("/constitutive", srv.constitutive) // read-only model form
 		v1.GET("/examples", srv.listExamples)
 		v1.GET("/examples/sand-ponding", srv.sandExample)
+		v1.GET("/examples/layered-sand", srv.layeredExample)
 	}
 	r.GET("/healthz", srv.health)
 	r.GET("/status", srv.status) // basic runtime state for monitoring
@@ -135,6 +136,7 @@ func (s *Server) constitutive(c *gin.Context) {
 			"richards_equation":    "dtheta/dt = d/dz [ K(h) * (dh/dz - 1) ], z positive downward",
 			"time_scheme":          "fully implicit backward Euler; full-Newton iteration (exact Jacobian, backtracking line search) per step; adaptive internal substepping",
 			"interblock_k":         "Kf = 2*K_i*K_{i+1}/(K_i+K_{i+1)} (harmonic mean, equal spacing)",
+			"interface_k":          "layered profile: Kf = (lu+ld)*Ku*Kd/(ld*Ku + lu*Kd) at a material interface (distance-weighted harmonic mean; flux continuous, h and theta may jump)",
 		},
 		Constants: map[string]float64{
 			"m":                      -1, // locked, echoed symbolically below
@@ -151,6 +153,9 @@ func (s *Server) constitutive(c *gin.Context) {
 			"units: m, s, K in m/s; flux positive downward",
 			"inter-cell conductivity uses the harmonic mean (never arithmetic)",
 			"bottom boundary is fixed per job: free_drainage or zero_flux",
+			"a job carries either one material block (uniform column) or a profile of material segments (layered column); every cell uses its own segment's retention and conductivity curves",
+			"material interfaces coincide exactly with cell faces; per-segment parameter legality (n>1, alpha>0, theta_r<theta_s, ks>0) is enforced per segment",
+			"the constitutive structure actually used by a job is echoed in its result under material_config",
 		},
 	}
 	// m is not a constant number; present the binding as an equation and
@@ -168,6 +173,13 @@ func (s *Server) sandExample(c *gin.Context) {
 	c.JSON(http.StatusOK, map[string]any{
 		"id":      job.SandPondingExampleID,
 		"request": job.SandPondingRequest(),
+	})
+}
+
+func (s *Server) layeredExample(c *gin.Context) {
+	c.JSON(http.StatusOK, map[string]any{
+		"id":      job.LayeredSandExampleID,
+		"request": job.LayeredSandRequest(),
 	})
 }
 

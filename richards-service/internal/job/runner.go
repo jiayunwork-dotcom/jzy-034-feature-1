@@ -9,7 +9,7 @@ import (
 // water content) is returned as solver.Failure; validation errors are
 // *ValidationError. Both are reported, never hidden or clipped.
 func Run(jobID string, req Request) (*Result, error) {
-	s, g, verr := buildSolver(req)
+	cfg, verr := buildSolver(req)
 	if verr != nil {
 		return nil, verr
 	}
@@ -22,13 +22,14 @@ func Run(jobID string, req Request) (*Result, error) {
 			Field: "time", Message: err.Error()}
 	}
 
-	p := s.Params
+	s := cfg.solver
 	res := &Result{
-		JobID:           jobID,
-		Grid:            gridInfo(g),
-		MLocked:         p.M(),
+		JobID:          jobID,
+		Grid:           gridInfo(cfg.grid),
+		MaterialConfig: cfg.materialConfig,
+		MLocked:        cfg.mLocked,
 		InitialStorageM: s.Storage(),
-		Steps:           make([]StepOutput, 0, nSteps),
+		Steps:          make([]StepOutput, 0, nSteps),
 	}
 
 	steps, err := s.MarchAdaptive(req.Time.StepSize, nSteps, solver.DefaultAdaptiveConfig())
@@ -39,6 +40,7 @@ func Run(jobID string, req Request) (*Result, error) {
 			TimeS:             sr.TimeAfter,
 			TopFlux:           sr.TopFlux,
 			BottomFlux:        sr.BottomFlux,
+			FaceFluxesM_S:     append([]float64(nil), sr.FaceFluxes...),
 			CumTopFluxM:       sr.CumTopFlux,
 			CumBottomFluxM:    sr.CumBottomFlux,
 			StorageM:          sr.StorageAfter,
@@ -46,7 +48,7 @@ func Run(jobID string, req Request) (*Result, error) {
 			MassBalanceRel:    sr.MassBalanceRelative,
 			Iterations:        sr.Iterations,
 			Substeps:          sr.Substeps,
-			Layers:            snapshots(g, sr.HAfter, sr.ThetaAfter),
+			Layers:            snapshots(cfg.grid, sr.HAfter, sr.ThetaAfter),
 		})
 	}
 	if err != nil {
@@ -69,34 +71,38 @@ func RunStep(jobID string, req StepRequest) (*StepResultResponse, error) {
 	full := Request{
 		Column:   req.Column,
 		Material: req.Material,
+		Profile:  req.Profile,
 		Initial:  req.Initial,
 		Boundary: req.Boundary,
 		Time:     TimeSpec{TotalTime: req.StepSize, StepSize: req.StepSize},
 		Options:  req.Options,
 	}
-	s, g, verr := buildSolver(full)
+	cfg, verr := buildSolver(full)
 	if verr != nil {
 		return nil, verr
 	}
 	if e := validateTime(req.StepSize, req.StepSize); e != nil {
 		return nil, e
 	}
+	s := cfg.solver
 	hBef, thBef, _, _, _ := s.State()
 	sr, err := s.Step(req.StepSize)
 	if err != nil {
 		return nil, err
 	}
 	out := &StepResultResponse{
-		JobID:   jobID,
-		Grid:    gridInfo(g),
-		MLocked: s.Params.M(),
-		Before:  snapshots(g, hBef, thBef),
-		After:   snapshots(g, sr.HAfter, sr.ThetaAfter),
+		JobID:          jobID,
+		Grid:           gridInfo(cfg.grid),
+		MaterialConfig: cfg.materialConfig,
+		MLocked:        cfg.mLocked,
+		Before:         snapshots(cfg.grid, hBef, thBef),
+		After:          snapshots(cfg.grid, sr.HAfter, sr.ThetaAfter),
 		Step: StepOutput{
 			Index:             1,
 			TimeS:             sr.TimeAfter,
 			TopFlux:           sr.TopFlux,
 			BottomFlux:        sr.BottomFlux,
+			FaceFluxesM_S:     append([]float64(nil), sr.FaceFluxes...),
 			CumTopFluxM:       sr.CumTopFlux,
 			CumBottomFluxM:    sr.CumBottomFlux,
 			StorageM:          sr.StorageAfter,
@@ -104,7 +110,7 @@ func RunStep(jobID string, req StepRequest) (*StepResultResponse, error) {
 			MassBalanceRel:    sr.MassBalanceRelative,
 			Iterations:        sr.Iterations,
 			Substeps:          1,
-			Layers:            snapshots(g, sr.HAfter, sr.ThetaAfter),
+			Layers:            snapshots(cfg.grid, sr.HAfter, sr.ThetaAfter),
 		},
 	}
 	return out, nil

@@ -71,6 +71,7 @@ internal/api/               Gin 路由与结构化错误
 | `GET  /api/v1/constitutive` | 只读：回显本构公式形式、m–n 绑定、固定常量 |
 | `GET  /api/v1/examples` | 内置算例清单 |
 | `GET  /api/v1/examples/sand-ponding` | 砂柱积水入渗算例（可直接 POST 回 /jobs） |
+| `GET  /api/v1/examples/layered-sand` | 细砂/粗砂分层积水入渗算例（毛细屏障） |
 | `GET  /healthz` | 存活探针 |
 | `GET  /status` | 基本运行状态/监控计数 |
 
@@ -90,9 +91,56 @@ internal/api/               Gin 路由与结构化错误
 
 `initial.kind` 支持：
 
-- `water_content`：逐层给 θ（长度必须等于层数）；
+- `water_content`：逐层给 θ（长度必须等于层数；分层柱按每格所属段的
+  [theta_r, theta_s] 校验）；
 - `pressure_head`：逐层给压力水头 h；
-- `hydrostatic`：给 `water_table_depth_m`，自动建立 h = z − z_wt 的静水平衡剖面。
+- `hydrostatic`：给 `water_table_depth_m`，自动建立 h = z − z_wt 的静水平衡剖面
+  （分层柱每格用所属段的持水曲线求 θ）。
+
+## 分层土柱（分段土壤剖面）
+
+作业可以在 `material`（整柱一种材料）与 `profile`（分段剖面）之间二选一提交；
+两者同时给出会被拒绝（`MATERIAL_PROFILE_CONFLICT`）。`profile` 形如：
+
+```json
+{
+  "column": {"thickness_m": 1.0, "num_layers": 60},
+  "profile": {"layers": [
+    {"thickness_m": 0.4, "num_layers": 24,
+     "alpha": 7.0, "n": 2.2, "theta_r": 0.05, "theta_s": 0.41, "ks": 6e-5},
+    {"thickness_m": 0.6, "num_layers": 36,
+     "alpha": 14.0, "n": 2.6, "theta_r": 0.04, "theta_s": 0.43, "ks": 1.2e-4}
+  ]},
+  "initial":  {"kind": "water_content", "water_content": ["...60 个值..."]},
+  "boundary": {"top": "ponded_head", "ponded_head_m": 0.02, "bottom": "free_drainage"},
+  "time":     {"total_time_s": 10800, "step_size_s": 60}
+}
+```
+
+- 段按深度顺序首尾相接，每段自带厚度与一整套 van Genuchten–Mualem 参数；
+  段厚度之和必须**精确**等于土柱厚度（否则 `PROFILE_THICKNESS_MISMATCH`），
+  每段厚度必须为正，段数至少为 1（一段即退化为单一材料，数值结果与
+  `material` 形式逐位一致）。
+- 每段的五类参数合法性（n>1、alpha>0、theta_r<theta_s、ks>0、厚度>0）逐段
+  校验，错误信息指明出问题的段号（`LAYER_PARAMS_INVALID` 等）。
+- 网格按段切分：材料分界面**精确落在计算格点边界上**，没有格点跨段取平均
+  参数。段内等分；`num_layers` 可在每段显式给出（总和须等于
+  `column.num_layers`），或全部省略由服务按厚度比例分配（大余数法，每段
+  至少 1 格）。
+- 分界面通量：界面两侧各自用自己的 K(h) 曲线，界面导水率取**距离加权调和
+  平均** `Kf = (lu+ld)·Ku·Kd/(ld·Ku + lu·Kd)`（即两个半网格串联阻力；等距时
+  退化为普通调和平均），界面两侧共享同一个面通量——通量连续，而压力水头与
+  含水量允许跨界面跳变（不同材料在同一 h 下 θ 本就不同）。该加权平均的
+  解析导数进入牛顿雅可比，材料导水率相差若干数量级时迭代仍稳定收敛。
+- 质量闭合：任意推进区间后整根分层土柱（以及每一段单独）的蓄水变化都精确
+  等于进出通量之和，闭合残差保持在 ~1e-10 m 量级，与均质柱相同。
+- 响应中的 `material_config` 如实回显作业实际使用的分段结构（各段厚度、
+  格点数与参数）；`grid` 额外给出 `face_depths_m`、`segment_of` 与
+  `interface_faces`；每步的 `face_fluxes_m_s` 给出全部面通量，可直接核对
+  每一段的质量平衡。
+
+单步接口 `POST /api/v1/steps` 同样接受 `profile`，与整段推进共用同一套分段
+网格与界面通量/雅可比组装逻辑。
 
 `step_size_s` 是**输出/报告**时间间隔；当某个区间内牛顿迭代困难时服务会自动在
 内部二分（不改变输出时刻），并在每个区间返回实际使用的 `substeps` 数。单步接口
@@ -136,4 +184,8 @@ go test -race ./...        # 含并发竞态检测
 
 覆盖：单步与整段的质量闭合、增大积水水头锋面更深且蓄水更多、降一个数量级 Ks
 锋面明显变慢、零通量静水剖面长时间不动、含水量全程不出界、调和与算术平均结果
-可区分、五类非法参数分别被挡、单步/整段同初值同结果、并发多作业互不串扰。
+可区分、五类非法参数分别被挡、单步/整段同初值同结果、并发多作业互不串扰；
+分层柱：两段同参数退化结果与均质逐位一致、非均匀网格质量闭合、分界面通量连续
+且两段各自质量平衡、界面两侧各用各的持水/导水曲线、细砂-粗砂界面处锋面明显
+滞留（毛细屏障）、强导水率对比下牛顿稳定收敛、按段校验初始剖面与参数、厚度
+加总不等于柱厚被拒、单步/整段分层结果一致。

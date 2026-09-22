@@ -187,12 +187,16 @@ func TestExampleEndpoints(t *testing.T) {
 		t.Fatalf("code %d", code)
 	}
 	lst := body["examples"].([]any)
-	if len(lst) != 1 {
+	if len(lst) != 2 {
 		t.Fatalf("examples %d", len(lst))
 	}
 	code, body = doJSON(t, h, "GET", "/api/v1/examples/sand-ponding", nil)
 	if code != http.StatusOK || body["id"] != job.SandPondingExampleID {
 		t.Fatalf("example endpoint %d %v", code, body)
+	}
+	code, body = doJSON(t, h, "GET", "/api/v1/examples/layered-sand", nil)
+	if code != http.StatusOK || body["id"] != job.LayeredSandExampleID {
+		t.Fatalf("layered example endpoint %d %v", code, body)
 	}
 }
 
@@ -203,6 +207,117 @@ func TestExampleSubmitsDirectly(t *testing.T) {
 	code, out := doJSON(t, h, "POST", "/api/v1/jobs", req)
 	if code != http.StatusOK {
 		t.Fatalf("submit preset example: %d %v", code, out)
+	}
+}
+
+func TestLayeredJobOverHTTP(t *testing.T) {
+	h := testRouter()
+	req := job.LayeredSandRequest()
+	code, out := doJSON(t, h, "POST", "/api/v1/jobs", req)
+	if code != http.StatusOK {
+		t.Fatalf("layered job code %d: %v", code, out)
+	}
+	res := out["result"].(map[string]any)
+	mc := res["material_config"].(map[string]any)
+	if mc["layered"] != true {
+		t.Fatalf("material_config not layered: %v", mc)
+	}
+	segs := mc["segments"].([]any)
+	if len(segs) != 2 {
+		t.Fatalf("segments %d", len(segs))
+	}
+	seg0 := segs[0].(map[string]any)
+	if seg0["thickness_m"].(float64) != 0.4 || seg0["alpha"].(float64) != 7.0 {
+		t.Fatalf("segment 0 echo: %v", seg0)
+	}
+	grid := res["grid"].(map[string]any)
+	if grid["layered"] != true {
+		t.Fatal("grid not flagged layered")
+	}
+	ifaces := grid["interface_faces"].([]any)
+	if len(ifaces) != 1 || ifaces[0].(float64) != 24 {
+		t.Fatalf("interface faces %v", ifaces)
+	}
+	if res["total_mass_balance_residual_m"].(float64) > 1e-9 {
+		t.Fatalf("closure %v", res["total_mass_balance_residual_m"])
+	}
+}
+
+func TestLayeredSingleStepOverHTTP(t *testing.T) {
+	h := testRouter()
+	full := job.LayeredSandRequest()
+	req := job.StepRequest{
+		Column:   full.Column,
+		Profile:  full.Profile,
+		Initial:  full.Initial,
+		Boundary: full.Boundary,
+		StepSize: 60,
+	}
+	code, out := doJSON(t, h, "POST", "/api/v1/steps", req)
+	if code != http.StatusOK {
+		t.Fatalf("layered step code %d: %v", code, out)
+	}
+	res := out["result"].(map[string]any)
+	if res["material_config"].(map[string]any)["layered"] != true {
+		t.Fatal("single-step response must echo the layered profile")
+	}
+	step := res["step"].(map[string]any)
+	if step["mass_balance_residual_m"].(float64) > 1e-9 {
+		t.Fatalf("closure %v", step["mass_balance_residual_m"])
+	}
+}
+
+func TestLayeredExampleSubmitsDirectly(t *testing.T) {
+	h := testRouter()
+	_, body := doJSON(t, h, "GET", "/api/v1/examples/layered-sand", nil)
+	code, out := doJSON(t, h, "POST", "/api/v1/jobs", body["request"])
+	if code != http.StatusOK {
+		t.Fatalf("submit layered example: %d %v", code, out)
+	}
+}
+
+func TestMaterialAndProfileConflictOverHTTP(t *testing.T) {
+	h := testRouter()
+	bad := job.LayeredSandRequest()
+	bad.Material = job.Material{Alpha: 6, N: 2, ThetaR: 0.05, ThetaS: 0.4, Ks: 5e-5}
+	code, body := doJSON(t, h, "POST", "/api/v1/jobs", bad)
+	if code != http.StatusUnprocessableEntity {
+		t.Fatalf("code %d", code)
+	}
+	e := body["error"].(map[string]any)
+	if e["code"] != "MATERIAL_PROFILE_CONFLICT" {
+		t.Fatalf("error %v", e)
+	}
+}
+
+func TestLayeredThicknessMismatchOverHTTP(t *testing.T) {
+	h := testRouter()
+	bad := job.LayeredSandRequest()
+	bad.Profile.Layers[1].Thickness = 0.5
+	code, body := doJSON(t, h, "POST", "/api/v1/jobs", bad)
+	if code != http.StatusUnprocessableEntity {
+		t.Fatalf("code %d", code)
+	}
+	e := body["error"].(map[string]any)
+	if e["code"] != "PROFILE_THICKNESS_MISMATCH" {
+		t.Fatalf("error %v", e)
+	}
+}
+
+func TestLayeredSegmentParamErrorNamesSegment(t *testing.T) {
+	h := testRouter()
+	bad := job.LayeredSandRequest()
+	bad.Profile.Layers[1].Material.N = 0.9
+	code, body := doJSON(t, h, "POST", "/api/v1/jobs", bad)
+	if code != http.StatusUnprocessableEntity {
+		t.Fatalf("code %d", code)
+	}
+	e := body["error"].(map[string]any)
+	if e["code"] != "LAYER_PARAMS_INVALID" {
+		t.Fatalf("error %v", e)
+	}
+	if !strings.Contains(e["message"].(string), "segment 1") {
+		t.Fatalf("error must name segment: %v", e)
 	}
 }
 

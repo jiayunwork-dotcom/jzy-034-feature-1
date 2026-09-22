@@ -14,7 +14,9 @@ type AggregatedStep struct {
 	HAfter        []float64
 	TopFlux       float64 // end-of-interval face flux [m/s]
 	BottomFlux    float64
-	CumTopFlux    float64 // cumulative depth [m]
+	FaceFluxes    []float64 // end-of-interval fluxes at all NZ+1 faces [m/s], downward +
+	CumFaceFluxes []float64 // cumulative depth [m] per face at interval end
+	CumTopFlux    float64   // cumulative depth [m]
 	CumBottomFlux float64
 	StorageBefore float64
 	StorageAfter  float64
@@ -101,6 +103,8 @@ func (s *Solver) StepAdaptive(interval float64, cfg AdaptiveConfig) (*Aggregated
 		HAfter:              append([]float64(nil), s.H...),
 		TopFlux:             last.TopFlux,
 		BottomFlux:          last.BottomFlux,
+		FaceFluxes:          append([]float64(nil), last.FaceFluxes...),
+		CumFaceFluxes:       append([]float64(nil), s.cumFace...),
 		CumTopFlux:          s.CumTop,
 		CumBottomFlux:       s.CumBot,
 		StorageBefore:       storageBefore,

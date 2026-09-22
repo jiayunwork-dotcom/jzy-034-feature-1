@@ -8,6 +8,17 @@
 // Jacobian of the face conductivities, backtracking line search) per time
 // step. Inter-cell conductivities are harmonic means.
 //
+// The column may be horizontally layered: each cell carries the van
+// Genuchten–Mualem parameter set of the material segment it belongs to,
+// and material interfaces coincide exactly with cell faces. Across such
+// an interface the pressure head and water content are free to jump (each
+// side uses its own retention curve), while the face flux is forced
+// continuous: the interface conductivity is the distance-weighted
+// harmonic mean of the two sides' own K(h), i.e. the two half-cell
+// resistances in series. The exact derivatives of that weighted mean
+// enter the Newton Jacobian, so the iteration stays convergent when the
+// neighbouring materials differ by orders of magnitude.
+//
 // Sign convention: boundary flux q is positive downward; qTop > 0 means
 // water entering the column at the top, qBot > 0 means water leaving the
 // column at the bottom.
@@ -103,15 +114,38 @@ func l2Norm(v []float64) float64 {
 	return math.Sqrt(s)
 }
 
+// meritOf is the line-search merit function: the L2 norm of the discrete
+// equations G_i = dz_i*R_i the Newton system is assembled from. On a
+// uniform grid this is l2Norm(R) (identical descent decisions, since G is
+// then a scalar multiple of R); on a non-uniform grid the per-cell dz
+// weighting makes the Newton direction a descent direction of the merit.
+func (s *Solver) meritOf(r []float64) float64 {
+	if s.Grid.Uniform {
+		return l2Norm(r)
+	}
+	sum := 0.0
+	for i, x := range r {
+		g := s.Grid.Dzs[i] * x
+		sum += g * g
+	}
+	return math.Sqrt(sum)
+}
+
 // Solver is the per-job stateful time marcher. A Solver instance belongs to
 // exactly one infiltration job; nothing is shared between instances.
 type Solver struct {
-	Params     constitutive.Params
-	Grid       Grid
-	Opts       Options
-	TopKind    string
-	PondedH    float64 // surface pressure head [m] when TopKind == TopPondedHead
+	Params  constitutive.Params // single-material parameter set (Profile == nil)
+	Profile *Profile            // layered profile (nil in the single-material case)
+	Grid    Grid
+	Opts    Options
+	TopKind string
+	PondedH float64 // surface pressure head [m] when TopKind == TopPondedHead
 	BottomKind string
+
+	// cellParams[i] is the van Genuchten–Mualem parameter set of the
+	// material segment owning cell i. Every constitutive evaluation at a
+	// cell goes through its own entry.
+	cellParams []constitutive.Params
 
 	// current state
 	H     []float64 // pressure heads at cell centres [m]
@@ -123,15 +157,23 @@ type Solver struct {
 	CumTop float64
 	CumBot float64
 
+	// cumFace[f] is the time-integrated downward water depth that crossed
+	// face f; cumFace[0] == CumTop and cumFace[NZ] == CumBot. It makes the
+	// exact per-segment water balance available over any interval,
+	// including across material interfaces.
+	cumFace []float64
+
 	steps int
 
 	// mean selects inter-block K averaging; harmonic in production.
 	mean interblockMean
 }
 
-// NewSolver builds a solver from an initial pressure-head profile.
-func NewSolver(p constitutive.Params, g Grid, topKind string, pondedH float64,
-	bottomKind string, initialHeads []float64, opts Options) (*Solver, error) {
+// paramsAt returns the constitutive parameters governing cell i.
+func (s *Solver) paramsAt(i int) constitutive.Params { return s.cellParams[i] }
+
+// applyOptions fills zero-valued option fields with defaults.
+func applyOptions(opts Options) Options {
 	if opts.MaxIterations <= 0 {
 		opts = DefaultOptions()
 	}
@@ -144,30 +186,57 @@ func NewSolver(p constitutive.Params, g Grid, topKind string, pondedH float64,
 	if opts.Relaxation <= 0 || opts.Relaxation > 1 {
 		opts.Relaxation = 1
 	}
+	return opts
+}
+
+func newSolver(uniform constitutive.Params, prof *Profile, g Grid,
+	topKind string, pondedH float64, bottomKind string,
+	initialHeads []float64, opts Options) (*Solver, error) {
+	opts = applyOptions(opts)
 	if len(initialHeads) != g.NZ {
-		return nil, fmt.Errorf("initial profile length %d does not match grid size %d", len(initialHeads), g.NZ)
+		return nil, fmt.Errorf("initial profile length %d does not match grid size %d",
+			len(initialHeads), g.NZ)
+	}
+	if prof != nil {
+		if g.MaterialOf == nil {
+			return nil, fmt.Errorf("layered profile requires a grid with cell-to-segment ownership")
+		}
+		if len(prof.Segments) < 1 {
+			return nil, fmt.Errorf("layered profile needs at least one segment")
+		}
 	}
 	s := &Solver{
-		Params: p, Grid: g, Opts: opts,
+		Params: uniform, Profile: prof, Grid: g, Opts: opts,
 		TopKind: topKind, PondedH: pondedH, BottomKind: bottomKind,
-		H:     append([]float64(nil), initialHeads...),
-		Theta: make([]float64, g.NZ),
-		mean:  HarmonicMean,
+		H:          append([]float64(nil), initialHeads...),
+		Theta:      make([]float64, g.NZ),
+		cellParams: cellParams(g.NZ, g.MaterialOf, uniform, prof),
+		cumFace:    make([]float64, g.NZ+1),
+		mean:       HarmonicMean,
 	}
 	for i := range s.H {
 		if math.IsNaN(s.H[i]) || math.IsInf(s.H[i], 0) {
 			return nil, fmt.Errorf("initial head at layer %d is not finite", i)
 		}
-		s.Theta[i] = p.WaterContent(s.H[i])
+		s.Theta[i] = s.paramsAt(i).WaterContent(s.H[i])
 	}
 	return s, nil
 }
 
-// NewSolverFromTheta builds a solver from an initial water-content profile.
+// NewSolver builds a single-material solver from an initial pressure-head
+// profile.
+func NewSolver(p constitutive.Params, g Grid, topKind string, pondedH float64,
+	bottomKind string, initialHeads []float64, opts Options) (*Solver, error) {
+	return newSolver(p, nil, g, topKind, pondedH, bottomKind, initialHeads, opts)
+}
+
+// NewSolverFromTheta builds a single-material solver from an initial
+// water-content profile.
 func NewSolverFromTheta(p constitutive.Params, g Grid, topKind string, pondedH float64,
 	bottomKind string, initialTheta []float64, opts Options) (*Solver, error) {
 	if len(initialTheta) != g.NZ {
-		return nil, fmt.Errorf("initial profile length %d does not match grid size %d", len(initialTheta), g.NZ)
+		return nil, fmt.Errorf("initial profile length %d does not match grid size %d",
+			len(initialTheta), g.NZ)
 	}
 	for i, th := range initialTheta {
 		if math.IsNaN(th) || math.IsInf(th, 0) || th < p.ThetaR-1e-12 || th > p.ThetaS+1e-12 {
@@ -182,6 +251,46 @@ func NewSolverFromTheta(p constitutive.Params, g Grid, topKind string, pondedH f
 	return NewSolver(p, g, topKind, pondedH, bottomKind, heads, opts)
 }
 
+// NewLayeredSolver builds a solver for a layered material profile from an
+// initial pressure-head profile. The grid must have been built from the
+// same profile (its faces aligned with the material interfaces).
+func NewLayeredSolver(prof *Profile, g Grid, topKind string, pondedH float64,
+	bottomKind string, initialHeads []float64, opts Options) (*Solver, error) {
+	if prof == nil {
+		return nil, fmt.Errorf("NewLayeredSolver requires a non-nil profile")
+	}
+	return newSolver(constitutive.Params{}, prof, g, topKind, pondedH, bottomKind,
+		initialHeads, opts)
+}
+
+// NewLayeredSolverFromTheta builds a layered-profile solver from an
+// initial water-content profile. Each value is range-checked against, and
+// inverted with, the retention curve of the material segment owning that
+// cell: the same numerical water content may be legal in one material and
+// out of range in another.
+func NewLayeredSolverFromTheta(prof *Profile, g Grid, topKind string, pondedH float64,
+	bottomKind string, initialTheta []float64, opts Options) (*Solver, error) {
+	if len(initialTheta) != g.NZ {
+		return nil, fmt.Errorf("initial profile length %d does not match grid size %d",
+			len(initialTheta), g.NZ)
+	}
+	owns := g.MaterialOf
+	if prof == nil || owns == nil {
+		return nil, fmt.Errorf("NewLayeredSolverFromTheta requires a layered profile/grid")
+	}
+	heads := make([]float64, len(initialTheta))
+	for i, th := range initialTheta {
+		pi := prof.Segments[owns[i]].Params
+		if math.IsNaN(th) || math.IsInf(th, 0) || th < pi.ThetaR-1e-12 || th > pi.ThetaS+1e-12 {
+			return nil, fmt.Errorf("%w: layer %d (segment %d) theta=%.6g outside "+
+				"[thetaR=%g, thetaS=%g]",
+				ErrThetaOutOfRange, i, owns[i], th, pi.ThetaR, pi.ThetaS)
+		}
+		heads[i] = pi.HeadFromWaterContent(th)
+	}
+	return NewLayeredSolver(prof, g, topKind, pondedH, bottomKind, heads, opts)
+}
+
 // State returns defensive copies of the current profile and cumulative
 // accounting (used by the orchestration layer; never hands out internal
 // slices so concurrent jobs cannot scribble on each other).
@@ -191,17 +300,32 @@ func (s *Solver) State() (h, theta []float64, time, cumTop, cumBot float64) {
 	return h, theta, s.Time, s.CumTop, s.CumBot
 }
 
-// Storage returns total water stored per unit area [m]: S = sum theta_i dz.
+// Storage returns total water stored per unit area [m]: S = sum theta_i dz_i.
 func (s *Solver) Storage() float64 {
-	sum := 0.0
-	for _, th := range s.Theta {
-		sum += th
+	if s.Grid.Uniform {
+		sum := 0.0
+		for _, th := range s.Theta {
+			sum += th
+		}
+		return sum * s.Grid.Dz
 	}
-	return sum * s.Grid.Dz
+	sum := 0.0
+	for i, th := range s.Theta {
+		sum += th * s.Grid.Dzs[i]
+	}
+	return sum
 }
 
 // Steps returns the number of successfully completed time steps.
 func (s *Solver) Steps() int { return s.steps }
+
+// CumFaceFluxes returns a defensive copy of the time-integrated downward
+// water depth [m] that has crossed every grid face (length NZ+1). With it
+// the exact balance of any sub-column — in particular each material
+// segment between two interfaces — can be verified over any interval.
+func (s *Solver) CumFaceFluxes() []float64 {
+	return append([]float64(nil), s.cumFace...)
+}
 
 // Failure is a structured compute failure (as opposed to an input
 // validation error; see the job package for the wire representation).
@@ -229,12 +353,14 @@ type StepResult struct {
 	Dt            float64   `json:"dt"`          // [s]
 	ThetaBefore   []float64 `json:"theta_before"`
 	ThetaAfter    []float64 `json:"theta_after"`
-	HBefore       []float64 `json:"h_before"`        // pressure heads [m]
-	HAfter        []float64 `json:"h_after"`         // [m]
+	HBefore       []float64 `json:"h_before"`    // pressure heads [m]
+	HAfter        []float64 `json:"h_after"`     // [m]
 	TopFlux       float64   `json:"top_flux"`        // step-end face flux [m/s], into column +
 	BottomFlux    float64   `json:"bottom_flux"`     // [m/s], out of column +
+	FaceFluxes    []float64 `json:"face_fluxes"`     // all NZ+1 face fluxes [m/s], downward +
+	CumFaceFluxes []float64 `json:"cum_face_fluxes"` // cumulative depth [m] per face
 	CumTopFlux    float64   `json:"cum_top_flux"`    // cumulative depth [m]
-	CumBottomFlux float64   `json:"cum_bottom_flux"` // [m]
+	CumBottomFlux float64   `json:"cum_bottom_flux"` // cumulative depth [m]
 	StorageBefore float64   `json:"storage_before"`  // [m]
 	StorageAfter  float64   `json:"storage_after"`   // [m]
 	// MassBalanceResidual is StorageChange - (qTop - qBot)*dt [m]; it must be
@@ -242,24 +368,39 @@ type StepResult struct {
 	MassBalanceResidual float64 `json:"mass_balance_residual"`
 	// MassBalanceRelative is the residual divided by the storage change
 	// magnitude (0 when the change is ~0).
-	MassBalanceRelative float64 `json:"mass_balance_relative"`
+	MassBalanceRelative float64 `json:"mass_relative"`
 	Iterations          int     `json:"iterations"`
 }
 
-// faceConductances fills gamma[f] = Kf/dz-like conductance for each of the
-// NZ+1 faces.
+// faceConductances fills gamma[f] = Kf/l-face-like conductance for each of
+// the NZ+1 faces.
 //
-// gamma[f] for interior faces f=1..NZ-1: harmonic-mean K / dz.
-// gamma[0]: 0 — the ponded-top face is state dependent (harmonic mean of
-// surface Ks and cell-0 K over the half-cell), assembled in fluxAt.
-// gamma[NZ]: 0 (bottom flux is evaluated explicitly in fluxAt).
+// Interior faces f=1..NZ-1: inter-block harmonic K divided by the
+// centre-to-centre distance. On a uniform grid the distance is dz and the
+// mean is literally 2*Ki*Kj/(Ki+Kj); on a piecewise-uniform layered grid
+// (or at a material interface between cells of different thickness) the
+// distance-weighted harmonic mean with the two half-cell distances is
+// used instead.
+//
+// gamma[0]: 0 except for the ponded top, where the state-dependent
+// surface conductance is stored; gamma[NZ]: 0 (bottom flux evaluated in
+// fluxAt).
 func (s *Solver) faceConductances(kCell []float64) (gamma []float64) {
-	nz := s.Grid.NZ
-	dz := s.Grid.Dz
+	g := &s.Grid
+	nz := g.NZ
 	gamma = make([]float64, nz+1)
-	for f := 1; f < nz; f++ {
-		kf := s.mean.mean(kCell[f-1], kCell[f])
-		gamma[f] = kf / dz
+	if g.Uniform {
+		dz := g.Dz
+		for f := 1; f < nz; f++ {
+			kf := s.mean.mean(kCell[f-1], kCell[f])
+			gamma[f] = kf / dz
+		}
+	} else {
+		for f := 1; f < nz; f++ {
+			lUp, lDown, lFace := g.faceGeometry(f)
+			kf := weightedFaceK(kCell[f-1], kCell[f], lUp, lDown)
+			gamma[f] = kf / lFace
+		}
 	}
 	if s.TopKind == TopPondedHead {
 		// state-dependent surface conductance
@@ -269,30 +410,42 @@ func (s *Solver) faceConductances(kCell []float64) (gamma []float64) {
 }
 
 // topConductance returns the surface-to-cell-0 conductance for a ponded
-// boundary: harmonic mean of the ponded-surface conductivity (Ks) and the
-// top-cell conductivity, across the half-cell distance dz/2.
+// boundary: harmonic mean of the ponded-surface conductivity (Ks of the
+// top material segment) and the top-cell conductivity, across the
+// half-cell distance dz0/2.
 func (s *Solver) topConductance(k0 float64) float64 {
-	kSurf := s.Params.Ks
+	kSurf := s.cellParams[0].Ks
 	kHarm := s.mean.mean(kSurf, k0)
-	return 2.0 * kHarm / s.Grid.Dz
+	return 2.0 * kHarm / s.Grid.Dzs[0]
 }
 
 // fluxAt evaluates all face fluxes qf[0..NZ] (positive downward) for the
 // current iterate h and cell conductivities kCell.
 func (s *Solver) fluxAt(h []float64, kCell []float64, gamma []float64) []float64 {
-	nz := s.Grid.NZ
-	dz := s.Grid.Dz
+	g := &s.Grid
+	nz := g.NZ
 	qf := make([]float64, nz+1)
-	for f := 1; f < nz; f++ {
-		kf := s.mean.mean(kCell[f-1], kCell[f])
-		// q = -Kf dH/dz ; H = h - z ; equally spaced centres dz apart.
-		qf[f] = kf + gamma[f]*(h[f-1]-h[f])
+	if g.Uniform {
+		for f := 1; f < nz; f++ {
+			kf := s.mean.mean(kCell[f-1], kCell[f])
+			// q = -Kf dH/dz ; H = h - z ; equally spaced centres dz apart.
+			qf[f] = kf + gamma[f]*(h[f-1]-h[f])
+		}
+	} else {
+		for f := 1; f < nz; f++ {
+			lUp, lDown, lFace := g.faceGeometry(f)
+			kf := weightedFaceK(kCell[f-1], kCell[f], lUp, lDown)
+			// q = Kf*(1 + (h_up - h_down)/lFace); a single shared face
+			// value, so the flux is continuous even across a material
+			// interface where h and theta jump.
+			qf[f] = kf + (kf/lFace)*(h[f-1]-h[f])
+		}
 	}
 	// top face
 	switch s.TopKind {
 	case TopPondedHead:
-		// boundary total head H_b = pondedH - 0; cell centre at z=dz/2.
-		qf[0] = gamma[0] * (s.PondedH - h[0] + dz/2.0)
+		// boundary total head H_b = pondedH - 0; cell centre at z = dz0/2.
+		qf[0] = gamma[0] * (s.PondedH - h[0] + s.Grid.Dzs[0]/2.0)
 	case TopZeroFlux:
 		qf[0] = 0
 	}
@@ -310,22 +463,26 @@ func (s *Solver) fluxAt(h []float64, kCell []float64, gamma []float64) []float64
 // and also returns theta, cell K, conductances and face fluxes used to
 // assemble the linear system.
 //
-//	R_i = (theta(hIt_i) - thetaOld_i)/dt - (qf_i - qf_{i+1})/dz
+//	R_i = (theta(hIt_i) - thetaOld_i)/dt - (qf_i - qf_{i+1})/dz_i
+//
+// Every constitutive evaluation at cell i uses that cell's own material
+// segment parameter set.
 func (s *Solver) residual(hIt, thetaOld []float64, dt float64,
 ) (r []float64, th, kCell, gamma, qf []float64) {
-	nz := s.Grid.NZ
-	dz := s.Grid.Dz
+	g := &s.Grid
+	nz := g.NZ
 	th = make([]float64, nz)
 	kCell = make([]float64, nz)
 	for i := 0; i < nz; i++ {
-		th[i] = s.Params.WaterContent(hIt[i])
-		kCell[i] = s.Params.ConductivitySe(thToSe(th[i], s.Params))
+		pi := s.paramsAt(i)
+		th[i] = pi.WaterContent(hIt[i])
+		kCell[i] = pi.ConductivitySe(thToSe(th[i], pi))
 	}
 	gamma = s.faceConductances(kCell)
 	qf = s.fluxAt(hIt, kCell, gamma)
 	r = make([]float64, nz)
 	for i := 0; i < nz; i++ {
-		r[i] = (th[i]-thetaOld[i])/dt - (qf[i]-qf[i+1])/dz
+		r[i] = (th[i]-thetaOld[i])/dt - (qf[i]-qf[i+1])/g.Dzs[i]
 	}
 	return r, th, kCell, gamma, qf
 }
@@ -352,8 +509,8 @@ func (s *Solver) Step(dt float64) (*StepResult, error) {
 	if dt <= 0 || math.IsNaN(dt) || math.IsInf(dt, 0) {
 		return nil, &Failure{Kind: FailNonConvergence, Message: fmt.Sprintf("invalid dt %g", dt)}
 	}
-	nz := s.Grid.NZ
-	dz := s.Grid.Dz
+	g := &s.Grid
+	nz := g.NZ
 
 	hOld := append([]float64(nil), s.H...)
 	thetaOld := append([]float64(nil), s.Theta...)
@@ -395,19 +552,21 @@ func (s *Solver) Step(dt float64) (*StepResult, error) {
 		}
 
 		// Assemble the full-Newton tridiagonal system J*dh = -G where
-		// G_i = dz*R_i = dz*(th-thOld)/dt - qf_i + qf_{i+1}. Exact
-		// derivatives of the (harmonic-mean) face conductivities are
-		// included, keeping quadratic convergence near a sharp wetting
+		// G_i = dz_i*R_i = dz_i*(th-thOld)/dt - qf_i + qf_{i+1}. Exact
+		// derivatives of the (harmonic / distance-weighted harmonic) face
+		// conductivities are included, including across material
+		// interfaces, keeping quadratic convergence near a sharp wetting
 		// front where Picard (frozen K) only converges linearly.
 		lower := make([]float64, nz) // J[i,i-1]
 		diag := make([]float64, nz)  // J[i,i]
 		upper := make([]float64, nz) // J[i,i+1]
 		rhs := make([]float64, nz)
 
-		// per-cell capacity and conductivity derivatives
+		// per-cell capacity and conductivity derivatives, each from the
+		// cell's own material curve.
 		dkCell := make([]float64, nz)
 		for i := 0; i < nz; i++ {
-			dkCell[i] = s.Params.DKDh(hIt[i])
+			dkCell[i] = s.paramsAt(i).DKDh(hIt[i])
 			if math.IsNaN(dkCell[i]) || math.IsInf(dkCell[i], 0) {
 				dkCell[i] = 0
 			}
@@ -416,38 +575,59 @@ func (s *Solver) Step(dt float64) (*StepResult, error) {
 		// saturated cells get their diagonal from face conductance
 		// couplings below.
 		for i := 0; i < nz; i++ {
-			capacity := s.Params.DThetaDH(hIt[i])
+			capacity := s.paramsAt(i).DThetaDH(hIt[i])
 			if capacity < 0 || math.IsNaN(capacity) {
 				capacity = 0
 			}
-			diag[i] = dz * capacity / dt
+			diag[i] = g.Dzs[i] * capacity / dt
 		}
 
 		// interior faces f = 1 .. nz-1:
-		//   qf = Kf * [1 + (h_{f-1} - h_f)/dz]
-		// R_i = dz*(th-thOld)/dt - qf_i + qf_{i+1}, so face f enters
-		// row f-1 with +qf (its bottom face) and row f with -qf (its top).
-		for f := 1; f < nz; f++ {
-			ku, kd := kCell[f-1], kCell[f]
-			kf := s.mean.mean(ku, kd)
-			factor := 1.0 + (hIt[f-1]-hIt[f])/dz
-			dqup := s.mean.dMeanDUp(ku, kd)*dkCell[f-1]*factor + kf/dz
-			dqdn := s.mean.dMeanDDown(ku, kd)*dkCell[f]*factor - kf/dz
-			diag[f-1] += dqup
-			upper[f-1] += dqdn
-			lower[f] += -dqup
-			diag[f] += -dqdn
+		//   qf = Kf * [1 + (h_{f-1} - h_f)/l]
+		// Face f enters row f-1 with +qf (its bottom face) and row f with
+		// -qf (its top). At a material interface Kf is the flux-continuous
+		// weighted harmonic mean of the two sides' own K(h); the chain-rule
+		// derivatives dKf/dK_up and dKf/dK_down carry the two different
+		// retention/conductivity curves into the Jacobian.
+		if g.Uniform {
+			dz := g.Dz
+			for f := 1; f < nz; f++ {
+				ku, kd := kCell[f-1], kCell[f]
+				kf := s.mean.mean(ku, kd)
+				factor := 1.0 + (hIt[f-1]-hIt[f])/dz
+				dqup := s.mean.dMeanDUp(ku, kd)*dkCell[f-1]*factor + kf/dz
+				dqdn := s.mean.dMeanDDown(ku, kd)*dkCell[f]*factor - kf/dz
+				diag[f-1] += dqup
+				upper[f-1] += dqdn
+				lower[f] += -dqup
+				diag[f] += -dqdn
+			}
+		} else {
+			for f := 1; f < nz; f++ {
+				ku, kd := kCell[f-1], kCell[f]
+				lUp, lDown, lFace := g.faceGeometry(f)
+				kf := weightedFaceK(ku, kd, lUp, lDown)
+				factor := 1.0 + (hIt[f-1]-hIt[f])/lFace
+				dqup := dWeightedFaceKDUp(ku, kd, lUp, lDown)*dkCell[f-1]*factor + kf/lFace
+				dqdn := dWeightedFaceKDDown(ku, kd, lUp, lDown)*dkCell[f]*factor - kf/lFace
+				diag[f-1] += dqup
+				upper[f-1] += dqdn
+				lower[f] += -dqup
+				diag[f] += -dqdn
+			}
 		}
 
 		// top face
 		switch s.TopKind {
 		case TopPondedHead:
-			// q0 = K0*(2/dz)*(hP - h0 + dz/2), K0 harmonic(Ks, K(h0));
-			// -q0 enters row 0.
-			k0Harm := s.mean.mean(s.Params.Ks, kCell[0])
-			factor0 := s.PondedH - hIt[0] + dz/2.0
-			dq0dn := s.mean.dMeanDDown(s.Params.Ks, kCell[0])*dkCell[0]*
-				(2.0/dz)*factor0 - k0Harm*2.0/dz
+			// q0 = K0*(2/dz0)*(hP - h0 + dz0/2), K0 harmonic(Ks_top, K(h0));
+			// -q0 enters row 0. Ks is taken from the top material segment.
+			dz0 := g.Dzs[0]
+			ksSurf := s.cellParams[0].Ks
+			k0Harm := s.mean.mean(ksSurf, kCell[0])
+			factor0 := s.PondedH - hIt[0] + dz0/2.0
+			dq0dn := s.mean.dMeanDDown(ksSurf, kCell[0])*dkCell[0]*
+				(2.0/dz0)*factor0 - k0Harm*2.0/dz0
 			diag[0] += -dq0dn
 		case TopZeroFlux:
 			// q0 = 0
@@ -459,7 +639,7 @@ func (s *Solver) Step(dt float64) (*StepResult, error) {
 		}
 
 		for i := 0; i < nz; i++ {
-			rhs[i] = -dz * r[i]
+			rhs[i] = -g.Dzs[i] * r[i]
 		}
 
 		// Regularise only rows that remain exactly uncoupled: saturated
@@ -471,7 +651,7 @@ func (s *Solver) Step(dt float64) (*StepResult, error) {
 		for i := 0; i < nz; i++ {
 			off := math.Abs(upper[i]) + math.Abs(lower[i])
 			if off == 0 && diag[i] == 0 {
-				diag[i] = dz * capacityFloor / dt
+				diag[i] = g.Dzs[i] * capacityFloor / dt
 			}
 		}
 		dh, ok := thomas(lower, diag, upper, rhs)
@@ -492,19 +672,24 @@ func (s *Solver) Step(dt float64) (*StepResult, error) {
 			tryRelax = math.Min(tryRelax, maxNewtonHeadStep/maxDh)
 		}
 
-		// Backtracking (Armijo) line search on the smooth L2 residual
-		// norm: the Newton step satisfies J dh = -G, so it is a descent
-		// direction for ||R||; shrink until sufficient decrease is found.
+		// Backtracking (Armijo) line search on the norm of the discrete
+		// equations G_i = dz_i*R_i that the Newton system J dh = -G is
+		// built from: the Newton step is then a descent direction for the
+		// merit by construction. On a uniform grid G = dz*R is a scalar
+		// rescaling of R, so the sufficient-decrease decisions (and hence
+		// every result) are bit-identical to using ||R|| directly; on a
+		// non-uniform layered grid the dz-weighting is required for the
+		// direction to be descending.
 		trial := make([]float64, nz)
 		descent := false
-		merit := l2Norm(r)
+		merit := s.meritOf(r)
 		var trialMerit float64
 		for attempt := 0; attempt < 40; attempt++ {
 			for i := range dh {
 				trial[i] = hIt[i] + tryRelax*dh[i]
 			}
 			rr, _, _, _, _ := s.residual(trial, thetaOld, dt)
-			trialMerit = l2Norm(rr)
+			trialMerit = s.meritOf(rr)
 			if !hasNonFinite(rr) && trialMerit < merit*(1.0-armijoC*tryRelax) {
 				descent = true
 				break
@@ -535,25 +720,27 @@ func (s *Solver) Step(dt float64) (*StepResult, error) {
 	maxR := maxAbs(r)
 	if !converged && maxR >= s.Opts.ResidualTol {
 		return nil, &Failure{Kind: FailNonConvergence, Message: fmt.Sprintf(
-			"Picard iteration did not converge in %d iterations: max|residual|=%g",
+			"Newton iteration did not converge in %d iterations: max|residual|=%g",
 			s.Opts.MaxIterations, maxR)}
 	}
 	if hasNonFinite(th) || hasNonFinite(hIt) {
 		return nil, &Failure{Kind: FailNonFinite, Message: "non-finite accepted state"}
 	}
 
-	// Bounds guard: every accepted layer must stay inside [thetaR, thetaS]
-	// and be finite. Out-of-range is a hard failure, never clipped.
+	// Bounds guard: every accepted layer must stay inside the
+	// [thetaR, thetaS] of the material segment it belongs to, and be
+	// finite. Out-of-range is a hard failure, never clipped.
 	for i, v := range th {
+		pi := s.paramsAt(i)
 		if math.IsNaN(v) || math.IsInf(v, 0) ||
 			math.IsNaN(hIt[i]) || math.IsInf(hIt[i], 0) {
 			return nil, &Failure{Kind: FailNonFinite,
 				Message: fmt.Sprintf("non-finite state at layer %d", i)}
 		}
-		if v < s.Params.ThetaR-1e-10 || v > s.Params.ThetaS+1e-10 {
+		if v < pi.ThetaR-1e-10 || v > pi.ThetaS+1e-10 {
 			return nil, &Failure{Kind: FailThetaOutOfRange, Message: fmt.Sprintf(
-				"layer %d theta=%.10g outside [thetaR=%g, thetaS=%g] at t≈%g s",
-				i, v, s.Params.ThetaR, s.Params.ThetaS, timeBefore+dt)}
+				"layer %d (segment %d) theta=%.10g outside [thetaR=%g, thetaS=%g] at t≈%g s",
+				i, g.MaterialIndex(i), v, pi.ThetaR, pi.ThetaS, timeBefore+dt)}
 		}
 	}
 
@@ -565,6 +752,9 @@ func (s *Solver) Step(dt float64) (*StepResult, error) {
 	s.Time = timeBefore + dt
 	s.CumTop += qTop * dt
 	s.CumBot += qBot * dt
+	for f := range qf {
+		s.cumFace[f] += qf[f] * dt
+	}
 	s.steps++
 
 	storageAfter := s.Storage()
@@ -586,6 +776,8 @@ func (s *Solver) Step(dt float64) (*StepResult, error) {
 		HAfter:              append([]float64(nil), hIt...),
 		TopFlux:             qTop,
 		BottomFlux:          qBot,
+		FaceFluxes:          append([]float64(nil), qf...),
+		CumFaceFluxes:       append([]float64(nil), s.cumFace...),
 		CumTopFlux:          s.CumTop,
 		CumBottomFlux:       s.CumBot,
 		StorageBefore:       storageBefore,

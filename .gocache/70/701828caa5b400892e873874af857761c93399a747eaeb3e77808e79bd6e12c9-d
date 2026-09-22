@@ -1,0 +1,8 @@
+=== RUN   TestDebugJacobianFD
+    debug_test.go:64: max rel diff 0 at 
+    debug_test.go:140: J[0,0]: analytic=3.382828825e-05 fd=3.382828827e-05 rel=7.71e-10
+    debug_test.go:140: J[0,1]: analytic=-9.028811405e-07 fd=-9.028811414e-07 rel=9.45e-10
+    debug_test.go:144: max relative Jacobian discrepancy: 9.446479200114729e-10
+--- PASS: TestDebugJacobianFD (0.04s)
+PASS
+ok  	richards-service/internal/solver	0.188s
