@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -187,12 +188,41 @@ func TestExampleEndpoints(t *testing.T) {
 		t.Fatalf("code %d", code)
 	}
 	lst := body["examples"].([]any)
-	if len(lst) != 1 {
+	if len(lst) != 2 {
 		t.Fatalf("examples %d", len(lst))
+	}
+	ids := map[string]bool{}
+	for _, e := range lst {
+		ids[e.(map[string]any)["id"].(string)] = true
+	}
+	if !ids[job.SandPondingExampleID] || !ids[job.LayeredSandExampleID] {
+		t.Fatalf("example ids %v", ids)
 	}
 	code, body = doJSON(t, h, "GET", "/api/v1/examples/sand-ponding", nil)
 	if code != http.StatusOK || body["id"] != job.SandPondingExampleID {
 		t.Fatalf("example endpoint %d %v", code, body)
+	}
+	code, body = doJSON(t, h, "GET", "/api/v1/examples/layered-sand", nil)
+	if code != http.StatusOK || body["id"] != job.LayeredSandExampleID {
+		t.Fatalf("layered example endpoint %d %v", code, body)
+	}
+}
+
+func TestLayeredExampleSubmitsDirectly(t *testing.T) {
+	h := testRouter()
+	_, body := doJSON(t, h, "GET", "/api/v1/examples/layered-sand", nil)
+	req := body["request"]
+	code, out := doJSON(t, h, "POST", "/api/v1/jobs", req)
+	if code != http.StatusOK {
+		t.Fatalf("submit layered example: %d %v", code, out)
+	}
+	res := out["result"].(map[string]any)
+	materials, _ := res["materials"].([]any)
+	if len(materials) != 2 {
+		t.Fatalf("echoed materials=%d", len(materials))
+	}
+	if math.Abs(res["total_mass_balance_residual_m"].(float64)) > 1e-9 {
+		t.Fatalf("layered closure %v", res["total_mass_balance_residual_m"])
 	}
 }
 

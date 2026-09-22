@@ -9,7 +9,7 @@ import (
 // water content) is returned as solver.Failure; validation errors are
 // *ValidationError. Both are reported, never hidden or clipped.
 func Run(jobID string, req Request) (*Result, error) {
-	s, g, verr := buildSolver(req)
+	s, g, prof, verr := buildSolver(req)
 	if verr != nil {
 		return nil, verr
 	}
@@ -22,11 +22,12 @@ func Run(jobID string, req Request) (*Result, error) {
 			Field: "time", Message: err.Error()}
 	}
 
-	p := s.Params
+	segOf := segmentOfCell(prof, g.NZ)
 	res := &Result{
 		JobID:           jobID,
-		Grid:            gridInfo(g),
-		MLocked:         p.M(),
+		Grid:            gridInfo(g, prof),
+		MLocked:         prof.Params[0].M(),
+		Materials:       append([]MaterialInfo(nil), prof.Segments...),
 		InitialStorageM: s.Storage(),
 		Steps:           make([]StepOutput, 0, nSteps),
 	}
@@ -46,7 +47,7 @@ func Run(jobID string, req Request) (*Result, error) {
 			MassBalanceRel:    sr.MassBalanceRelative,
 			Iterations:        sr.Iterations,
 			Substeps:          sr.Substeps,
-			Layers:            snapshots(g, sr.HAfter, sr.ThetaAfter),
+			Layers:            snapshots(g, segOf, sr.HAfter, sr.ThetaAfter),
 		})
 	}
 	if err != nil {
@@ -67,14 +68,15 @@ func Run(jobID string, req Request) (*Result, error) {
 // same buildSolver + solver.Step machinery as Run.
 func RunStep(jobID string, req StepRequest) (*StepResultResponse, error) {
 	full := Request{
-		Column:   req.Column,
-		Material: req.Material,
-		Initial:  req.Initial,
-		Boundary: req.Boundary,
-		Time:     TimeSpec{TotalTime: req.StepSize, StepSize: req.StepSize},
-		Options:  req.Options,
+		Column:    req.Column,
+		Material:  req.Material,
+		Materials: req.Materials,
+		Initial:   req.Initial,
+		Boundary:  req.Boundary,
+		Time:      TimeSpec{TotalTime: req.StepSize, StepSize: req.StepSize},
+		Options:   req.Options,
 	}
-	s, g, verr := buildSolver(full)
+	s, g, prof, verr := buildSolver(full)
 	if verr != nil {
 		return nil, verr
 	}
@@ -86,12 +88,14 @@ func RunStep(jobID string, req StepRequest) (*StepResultResponse, error) {
 	if err != nil {
 		return nil, err
 	}
+	segOf := segmentOfCell(prof, g.NZ)
 	out := &StepResultResponse{
-		JobID:   jobID,
-		Grid:    gridInfo(g),
-		MLocked: s.Params.M(),
-		Before:  snapshots(g, hBef, thBef),
-		After:   snapshots(g, sr.HAfter, sr.ThetaAfter),
+		JobID:     jobID,
+		Grid:      gridInfo(g, prof),
+		MLocked:   prof.Params[0].M(),
+		Materials: append([]MaterialInfo(nil), prof.Segments...),
+		Before:    snapshots(g, segOf, hBef, thBef),
+		After:     snapshots(g, segOf, sr.HAfter, sr.ThetaAfter),
 		Step: StepOutput{
 			Index:             1,
 			TimeS:             sr.TimeAfter,
@@ -104,7 +108,7 @@ func RunStep(jobID string, req StepRequest) (*StepResultResponse, error) {
 			MassBalanceRel:    sr.MassBalanceRelative,
 			Iterations:        sr.Iterations,
 			Substeps:          1,
-			Layers:            snapshots(g, sr.HAfter, sr.ThetaAfter),
+			Layers:            snapshots(g, segOf, sr.HAfter, sr.ThetaAfter),
 		},
 	}
 	return out, nil

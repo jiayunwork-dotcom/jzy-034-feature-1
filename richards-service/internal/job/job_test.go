@@ -16,9 +16,10 @@ func baseRequest() Request {
 	for i := range th {
 		th[i] = 0.15
 	}
+	m := Material{Alpha: 6.0, N: 2.0, ThetaR: 0.05, ThetaS: 0.40, Ks: 5e-5}
 	return Request{
 		Column:   Column{Thickness: 1.0, NZ: nz},
-		Material: Material{Alpha: 6.0, N: 2.0, ThetaR: 0.05, ThetaS: 0.40, Ks: 5e-5},
+		Material: &m,
 		Initial:  Initial{Kind: "water_content", WaterContent: th},
 		Boundary: Boundary{Top: solver.TopPondedHead, PondedHead: 0.02, Bottom: solver.BottomFreeDrainage},
 		Time:     TimeSpec{TotalTime: 5400, StepSize: 30},
@@ -176,9 +177,10 @@ func TestSingleStepAndFullRunSameInitialResult(t *testing.T) {
 }
 
 func TestSingleStepReportsBeforeAfterAndResidual(t *testing.T) {
+	m := Material{Alpha: 6.0, N: 2.0, ThetaR: 0.05, ThetaS: 0.40, Ks: 5e-5}
 	r := StepRequest{
 		Column:   Column{Thickness: 1.0, NZ: 20},
-		Material: Material{Alpha: 6.0, N: 2.0, ThetaR: 0.05, ThetaS: 0.40, Ks: 5e-5},
+		Material: &m,
 		Initial:  Initial{Kind: "water_content", WaterContent: repeatSlice(0.15, 20)},
 		Boundary: Boundary{Top: solver.TopPondedHead, PondedHead: 0.02, Bottom: solver.BottomFreeDrainage},
 		StepSize: 30,
@@ -202,9 +204,10 @@ func TestSingleStepReportsBeforeAfterAndResidual(t *testing.T) {
 }
 
 func TestHydrostaticZeroFluxStaysStill(t *testing.T) {
+	m := Material{Alpha: 6.0, N: 2.0, ThetaR: 0.05, ThetaS: 0.40, Ks: 5e-5}
 	r := Request{
 		Column:   Column{Thickness: 1.0, NZ: 30},
-		Material: Material{Alpha: 6.0, N: 2.0, ThetaR: 0.05, ThetaS: 0.40, Ks: 5e-5},
+		Material: &m,
 		Initial:  Initial{Kind: "hydrostatic", WaterTableDepthM: 1.5},
 		Boundary: Boundary{Top: solver.TopZeroFlux, Bottom: solver.BottomZeroFlux},
 		Time:     TimeSpec{TotalTime: 7200, StepSize: 300},

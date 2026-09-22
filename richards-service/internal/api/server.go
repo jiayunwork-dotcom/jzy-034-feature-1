@@ -40,6 +40,7 @@ func NewServer(m *job.Manager) *gin.Engine {
 		v1.GET("/constitutive", srv.constitutive) // read-only model form
 		v1.GET("/examples", srv.listExamples)
 		v1.GET("/examples/sand-ponding", srv.sandExample)
+		v1.GET("/examples/layered-sand", srv.layeredSandExample)
 	}
 	r.GET("/healthz", srv.health)
 	r.GET("/status", srv.status) // basic runtime state for monitoring
@@ -135,6 +136,8 @@ func (s *Server) constitutive(c *gin.Context) {
 			"richards_equation":    "dtheta/dt = d/dz [ K(h) * (dh/dz - 1) ], z positive downward",
 			"time_scheme":          "fully implicit backward Euler; full-Newton iteration (exact Jacobian, backtracking line search) per step; adaptive internal substepping",
 			"interblock_k":         "Kf = 2*K_i*K_{i+1}/(K_i+K_{i+1)} (harmonic mean, equal spacing)",
+			"material_interface":   "G = 1/(d_up/K_up(h_up) + d_down/K_down(h_down)), q = span*G + G*(h_up-h_down); each side uses its own VG-M curve; one shared face flux (flux continuous); h and theta on the two sides are independent unknowns",
+			"layered_profile":      "materials[] lists segments top-to-bottom (thickness + alpha,n,theta_r,theta_s,ks[,num_layers]); segment interfaces are aligned exactly with grid faces; material/materials are mutually exclusive",
 		},
 		Constants: map[string]float64{
 			"m":                      -1, // locked, echoed symbolically below
@@ -168,6 +171,13 @@ func (s *Server) sandExample(c *gin.Context) {
 	c.JSON(http.StatusOK, map[string]any{
 		"id":      job.SandPondingExampleID,
 		"request": job.SandPondingRequest(),
+	})
+}
+
+func (s *Server) layeredSandExample(c *gin.Context) {
+	c.JSON(http.StatusOK, map[string]any{
+		"id":      job.LayeredSandExampleID,
+		"request": job.LayeredSandRequest(),
 	})
 }
 
